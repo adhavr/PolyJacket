@@ -409,7 +409,7 @@ def calculate_sell_value(user_shares: float, current_side_shares: float, other_s
     try:
         before = b * math.log(math.exp(current_side_shares / b) + math.exp(other_shares / b))
         after  = b * math.log(math.exp((current_side_shares - user_shares) / b) + math.exp(other_shares / b))
-        return max(0.0, before - after)
+        return int(max(0.0, before - after))
     except:
         return 0.0
 
@@ -561,6 +561,16 @@ def get_user_portfolio(user_id: int) -> Portfolio:
             # Open/Closed: show max possible payout
             potential_payout = max(home_shares, away_shares)
         
+        # Calculate current sell-back value for open/closed positions
+        if market_status != "settled":
+            mkt_home = pos_market.get("market_home_shares", 0)
+            mkt_away = pos_market.get("market_away_shares", 0)
+            home_val = calculate_sell_value(home_shares, mkt_home, mkt_away) if home_shares > 0 else 0.0
+            away_val = calculate_sell_value(away_shares, mkt_away, mkt_home) if away_shares > 0 else 0.0
+            current_value = round(home_val + away_val, 2)
+        else:
+            current_value = None
+
         position = Position(
             market_id=pos_market["market_id"],
             game=f"{pos_market['home_team']} vs {pos_market['away_team']}",
@@ -568,7 +578,8 @@ def get_user_portfolio(user_id: int) -> Portfolio:
             away_shares=away_shares,
             avg_home_price=pos_market.get("avg_home_price", 0),
             avg_away_price=pos_market.get("avg_away_price", 0),
-            potential_payout=round(potential_payout, 2)
+            potential_payout=round(potential_payout, 2),
+            current_value=current_value
         )
         
         if market_status == "settled":
@@ -925,7 +936,7 @@ async def execute_trade(trade: TradeRequest, user: Optional[Dict] = Depends(get_
         shares_purchased=round(shares_to_buy, 2),
         price_per_share=round(price_per_share, 2),
         total_cost=round(actual_cost, 2),
-        new_balance=round(new_balance, 2),
+        new_balance=int(new_balance),
         new_position=new_position,
         message=f"Successfully purchased {round(shares_to_buy, 2)} shares",
         home_elo=market.get("home_elo"),

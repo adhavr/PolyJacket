@@ -277,7 +277,13 @@ def get_user_positions(user_id: int) -> List[Dict]:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT p.*, m.* 
+        SELECT p.*,
+               m.home_team, m.away_team, m.sport, m.game_time, m.game_date,
+               m.status, m.home_price, m.away_price,
+               m.home_shares AS market_home_shares,
+               m.away_shares AS market_away_shares,
+               m.total_volume, m.winner, m.home_score, m.away_score,
+               m.home_elo, m.away_elo
         FROM positions p
         JOIN markets m ON p.market_id = m.market_id
         WHERE p.user_id = ?
