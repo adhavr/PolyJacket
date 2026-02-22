@@ -26,3 +26,9 @@ Thumbs.db
 # Project specific
 games_cache.json
 loaded_page.html
+
+# Data files — persisted on Railway volume, not committed to git
+data/*.db
+data/*.json
+# Keep the data/ directory itself
+!data/.gitkeep
