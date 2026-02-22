@@ -92,6 +92,8 @@
         const adminSettleResult = ref(null);
         const adminSettleError = ref(null);
         const adminSettleProcessing = ref(false);
+        const adminScoreCheck = ref(null);
+        const adminScoreCheckLoading = ref(false);
         const adminAllMarkets = ref([]);
         const showTradeModal = ref(false);
         const selectedMarket = ref(null);
@@ -139,6 +141,9 @@
         const scoreReportHome = ref('');
         const scoreReportAway = ref('');
         const scoreReportLoading = ref(false);
+        const userScoreCheck = ref(null);
+        const userScoreCheckLoading = ref(false);
+        const userScoreCheckConfirmed = ref(false);
 
         // Computed
         const uniqueSports = computed(() => {
@@ -348,6 +353,7 @@
           localStorage.removeItem('user');
           portfolio.value = null;
           userBalance.value = 0;
+          activeTab.value = 'markets';
         }
 
         function openAuthModal(mode = 'login') {
@@ -922,6 +928,30 @@
           finally { adminRaffleClosing.value = false; }
         }
 
+        async function checkScoreCredibility() {
+          adminScoreCheck.value = null;
+          if (!adminSettleMarketId.value) return;
+          const h = parseInt(adminSettleHomeScore.value);
+          const a = parseInt(adminSettleAwayScore.value);
+          if (isNaN(h) || isNaN(a) || h < 0 || a < 0) return;
+          adminScoreCheckLoading.value = true;
+          try {
+            const params = new URLSearchParams({ market_id: adminSettleMarketId.value, home_score: h, away_score: a });
+            const res = await fetch(`/api/admin/check-score?${params}`, {
+              headers: { 'Authorization': `Bearer ${token.value}` }
+            });
+            if (res.ok) adminScoreCheck.value = await res.json();
+          } catch { adminScoreCheck.value = null; }
+          finally { adminScoreCheckLoading.value = false; }
+        }
+
+        let scoreCheckTimeout = null;
+        watch([adminSettleHomeScore, adminSettleAwayScore, adminSettleMarketId], () => {
+          adminScoreCheck.value = null;
+          clearTimeout(scoreCheckTimeout);
+          scoreCheckTimeout = setTimeout(checkScoreCredibility, 600);
+        });
+
         async function adminSettleGame() {
           adminSettleError.value = null;
           adminSettleResult.value = null;
@@ -1040,6 +1070,18 @@
             chatError.value = 'Enter scores for both teams';
             return;
           }
+          // Run check if not yet done
+          if (!userScoreCheck.value && !userScoreCheckLoading.value) {
+            await checkUserScoreCredibility();
+          }
+          if (userScoreCheck.value?.severity === 'alert') {
+            chatError.value = 'Score blocked: ' + (userScoreCheck.value.flags?.[0] || 'score appears invalid');
+            return;
+          }
+          if (userScoreCheck.value?.severity === 'warning' && !userScoreCheckConfirmed.value) {
+            userScoreCheckConfirmed.value = true;
+            return;
+          }
           scoreReportLoading.value = true;
           try {
             const response = await fetch(`/api/markets/${expandedMarket.value.market_id}/score-report`, {
@@ -1059,6 +1101,8 @@
               scoreReportHome.value = '';
               scoreReportAway.value = '';
               showScoreReport.value = false;
+              userScoreCheck.value = null;
+              userScoreCheckConfirmed.value = false;
               chatError.value = null;
               await nextTick();
               const chatContainer = document.querySelector('.chat-messages');
@@ -1073,6 +1117,34 @@
             scoreReportLoading.value = false;
           }
         }
+
+        async function checkUserScoreCredibility() {
+          if (!expandedMarket.value) return;
+          const h = parseInt(scoreReportHome.value);
+          const a = parseInt(scoreReportAway.value);
+          if (isNaN(h) || isNaN(a) || h < 0 || a < 0) { userScoreCheck.value = null; return; }
+          userScoreCheckLoading.value = true;
+          userScoreCheck.value = null;
+          userScoreCheckConfirmed.value = false;
+          try {
+            const params = new URLSearchParams({ home_score: h, away_score: a });
+            const res = await fetch(`/api/markets/${expandedMarket.value.market_id}/check-score?${params}`, {
+              headers: token.value ? { 'Authorization': `Bearer ${token.value}` } : {}
+            });
+            if (res.ok) userScoreCheck.value = await res.json();
+          } catch {}
+          finally { userScoreCheckLoading.value = false; }
+        }
+
+        let userScoreCheckTimeout = null;
+        watch([scoreReportHome, scoreReportAway], () => {
+          userScoreCheck.value = null;
+          userScoreCheckConfirmed.value = false;
+          clearTimeout(userScoreCheckTimeout);
+          if (scoreReportHome.value !== '' && scoreReportAway.value !== '') {
+            userScoreCheckTimeout = setTimeout(checkUserScoreCredibility, 600);
+          }
+        });
 
         async function loadExpandedChart(market) {
           try {
@@ -1389,6 +1461,9 @@
           scoreReportHome,
           scoreReportAway,
           scoreReportLoading,
+          userScoreCheck,
+          userScoreCheckLoading,
+          userScoreCheckConfirmed,
           sendScoreReport,
           voteOnScoreReport,
           // Admin
@@ -1409,7 +1484,10 @@
           adminCloseRaffle,
           adminOpenRaffle,
           adminSettleGame,
-          adminFetchMarkets
+          adminFetchMarkets,
+          adminScoreCheck,
+          adminScoreCheckLoading,
+          checkScoreCredibility
         };
       },
       
@@ -1857,6 +1935,23 @@
                     <input type="number" v-model.number="adminSettleAwayScore" min="0" class="admin-score-input" placeholder="0">
                   </div>
                 </div>
+                <!-- Score Credibility Check -->
+                <div v-if="adminScoreCheckLoading" class="score-check-panel score-check-loading">Checking score credibility…</div>
+                <div v-if="adminScoreCheck && !adminScoreCheckLoading" :class="['score-check-panel', 'score-check-' + adminScoreCheck.severity]">
+                  <div class="score-check-header">
+                    <span class="score-check-icon">{{ adminScoreCheck.severity === 'ok' ? '✓' : adminScoreCheck.severity === 'warning' ? '⚠' : '🚨' }}</span>
+                    <span class="score-check-title">{{ adminScoreCheck.severity === 'ok' ? 'Score looks credible' : adminScoreCheck.severity === 'warning' ? 'Minor anomaly detected' : 'Suspicious score' }}</span>
+                    <span class="score-check-prob">{{ adminScoreCheck.home_team }} {{ (adminScoreCheck.elo_win_prob * 100).toFixed(0) }}% win prob</span>
+                  </div>
+                  <div class="score-check-meta">
+                    Expected: {{ adminScoreCheck.expected_margin > 0 ? adminScoreCheck.home_team : adminScoreCheck.away_team }} by {{ Math.abs(adminScoreCheck.expected_margin).toFixed(0) }} pts
+                    &nbsp;·&nbsp;
+                    Reported: {{ adminScoreCheck.reported_margin > 0 ? adminScoreCheck.home_team : (adminScoreCheck.reported_margin < 0 ? adminScoreCheck.away_team : 'Tie') }}{{ adminScoreCheck.reported_margin !== 0 ? ' by ' + Math.abs(adminScoreCheck.reported_margin) : '' }}
+                  </div>
+                  <ul v-if="adminScoreCheck.flags.length" class="score-check-flags">
+                    <li v-for="flag in adminScoreCheck.flags" :key="flag">{{ flag }}</li>
+                  </ul>
+                </div>
                 <div v-if="adminSettleResult" class="admin-success">{{ adminSettleResult }}</div>
                 <div v-if="adminSettleError" class="admin-error">{{ adminSettleError }}</div>
                 <button
@@ -2144,7 +2239,17 @@
                              :class="['chat-message', msg.message_type === 'score_report' ? 'score-report-msg' : '']">
                           <template v-if="msg.message_type === 'score_report'">
                             <div class="score-report-label">📊 Score Update</div>
-                            <div class="score-report-score">{{ msg.message }}</div>
+                            <div class="score-report-scoreboard">
+                              <div class="srb-row">
+                                <span class="srb-team-name">{{ msg.message.split(' \u2013 ')[0]?.split(' ').slice(0,-1).join(' ') }}</span>
+                                <span class="srb-score">{{ msg.message.split(' \u2013 ')[0]?.split(' ').at(-1) }}</span>
+                              </div>
+                              <div class="srb-divider"></div>
+                              <div class="srb-row">
+                                <span class="srb-team-name">{{ msg.message.split(' \u2013 ')[1]?.split(' ').slice(0,-1).join(' ') }}</span>
+                                <span class="srb-score">{{ msg.message.split(' \u2013 ')[1]?.split(' ').at(-1) }}</span>
+                              </div>
+                            </div>
                             <div class="score-report-footer">
                               <div class="score-report-votes">
                                 <button @click.stop="voteOnScoreReport(msg.message_id, 'up')"
@@ -2199,9 +2304,25 @@
                             <input v-model="scoreReportAway" type="number" min="0" placeholder="0" class="score-input">
                             <span class="score-team-label">{{ expandedMarket.away_team }}</span>
                           </div>
+                          <div v-if="userScoreCheckLoading" class="score-check-panel score-check-loading" style="margin-bottom:6px">Checking score…</div>
+                          <div v-if="userScoreCheck && !userScoreCheckLoading" :class="['score-check-panel', 'score-check-' + userScoreCheck.severity]" style="margin-bottom:6px">
+                            <div class="score-check-header">
+                              <span>{{ userScoreCheck.severity === 'ok' ? '✓' : userScoreCheck.severity === 'warning' ? '⚠' : '🚫' }}</span>
+                              <span>{{ userScoreCheck.severity === 'ok' ? 'Score looks valid' : userScoreCheck.severity === 'warning' ? 'Unusual score — confirm to post' : 'Score blocked' }}</span>
+                            </div>
+                            <ul v-if="userScoreCheck.flags.length" class="score-check-flags">
+                              <li v-for="flag in userScoreCheck.flags" :key="flag">{{ flag }}</li>
+                            </ul>
+                          </div>
                           <div class="score-report-actions">
-                            <button @click="sendScoreReport" class="submit-score-btn" :disabled="scoreReportLoading || scoreReportHome === '' || scoreReportAway === ''">{{ scoreReportLoading ? 'Posting...' : 'Post Score' }}</button>
-                            <button @click="showScoreReport = false" class="cancel-score-btn">Cancel</button>
+                            <button @click="sendScoreReport"
+                              :class="['submit-score-btn', userScoreCheckConfirmed ? 'submit-score-btn-warn' : '']"
+                              :disabled="scoreReportLoading || scoreReportHome === '' || scoreReportAway === '' || userScoreCheck?.severity === 'alert'">
+                              <span v-if="scoreReportLoading">Posting…</span>
+                              <span v-else-if="userScoreCheckConfirmed">⚠ Post Anyway?</span>
+                              <span v-else>Post Score</span>
+                            </button>
+                            <button @click="showScoreReport = false; userScoreCheckConfirmed = false" class="cancel-score-btn">Cancel</button>
                           </div>
                         </div>
                       </div>
@@ -3704,25 +3825,53 @@
 
     /* ── Score Report ─────────────────────────────── */
     .score-report-msg {
-      background: #fffbeb !important;
-      border-left: 3px solid #d97706 !important;
+      background: #faf5ff !important;
+      border-left: 3px solid #9370DB !important;
       padding: 9px 10px !important;
     }
 
     .score-report-label {
       font-size: 0.68rem;
       font-weight: 700;
-      color: #92400e;
+      color: #7c3aed;
       text-transform: uppercase;
       letter-spacing: 0.05em;
-      margin-bottom: 3px;
+      margin-bottom: 6px;
     }
 
-    .score-report-score {
-      font-size: 0.95rem;
-      font-weight: 700;
-      color: #0f172a;
+    .score-report-scoreboard {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      margin-bottom: 6px;
     }
+
+    .srb-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+
+    .srb-row:first-child { border-bottom: 1px solid #e9d5ff; }
+
+    .srb-team-name {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #1e1b4b;
+      flex: 1;
+    }
+
+    .srb-score {
+      font-size: 1.15rem;
+      font-weight: 800;
+      color: #6d28d9;
+      min-width: 28px;
+      text-align: right;
+    }
+
+    .srb-divider { display: none; }
 
     .score-report-footer {
       display: flex;
@@ -3758,23 +3907,23 @@
 
     .score-report-toggle-btn {
       padding: 5px 8px;
-      background: #fffbeb;
-      border: 1px solid #fde68a;
+      background: #faf5ff;
+      border: 1px solid #e9d5ff;
       border-radius: 4px;
       cursor: pointer;
       font-size: 0.85rem;
       flex-shrink: 0;
-      color: #92400e;
+      color: #7c3aed;
       transition: background 0.12s;
     }
 
-    .score-report-toggle-btn:hover { background: #fef3c7; }
+    .score-report-toggle-btn:hover { background: #f3e8ff; }
 
     .score-report-form {
       margin-top: 8px;
       padding: 10px;
-      background: #fffbeb;
-      border: 1px solid #fde68a;
+      background: #faf5ff;
+      border: 1px solid #e9d5ff;
       border-radius: 4px;
     }
 
@@ -3797,7 +3946,7 @@
     .score-input {
       width: 48px;
       padding: 5px 6px;
-      border: 1px solid #fde68a;
+      border: 1px solid #e9d5ff;
       border-radius: 4px;
       font-size: 0.95rem;
       font-weight: 700;
@@ -3805,7 +3954,7 @@
       background: white;
     }
 
-    .score-input:focus { outline: none; border-color: #d97706; }
+    .score-input:focus { outline: none; border-color: #9370DB; }
 
     .score-sep {
       font-weight: 700;
@@ -3818,7 +3967,7 @@
     .submit-score-btn {
       flex: 1;
       padding: 6px 12px;
-      background: #d97706;
+      background: #9370DB;
       color: white;
       border: none;
       border-radius: 4px;
@@ -3828,8 +3977,10 @@
       transition: background 0.12s;
     }
 
-    .submit-score-btn:hover:not(:disabled) { background: #b45309; }
+    .submit-score-btn:hover:not(:disabled) { background: #7B2FBE; }
     .submit-score-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .submit-score-btn-warn { background: #d97706 !important; }
+    .submit-score-btn-warn:hover:not(:disabled) { background: #b45309 !important; }
 
     .cancel-score-btn {
       padding: 6px 12px;
@@ -4328,6 +4479,28 @@
       padding-bottom: 5px;
     }
 
+    /* ── Score Credibility Panel ── */
+    .score-check-panel {
+      border-radius: 4px;
+      padding: 10px 14px;
+      margin: 2px 0;
+      font-size: 0.82rem;
+      border: 1px solid;
+    }
+    .score-check-ok { background: #f5f0ff; border-color: #c4b5fd; color: #6d28d9; }
+    .score-check-warning { background: #ede9fe; border-color: #a78bfa; color: #6d28d9; }
+    .score-check-alert { background: #ddd6fe; border-color: #7c3aed; color: #5b21b6; }
+    .score-check-loading { background: #faf5ff; border-color: #e9d5ff; color: #7c3aed; }
+    .score-check-header { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 4px; }
+    .score-check-prob { margin-left: auto; font-weight: 400; font-size: 0.78rem; opacity: 0.8; }
+    .score-check-meta { font-size: 0.78rem; opacity: 0.85; margin-bottom: 4px; }
+    .score-check-flags { margin: 6px 0 0; padding-left: 18px; }
+    .score-check-flags li { margin-bottom: 3px; }
+    html.dark .score-check-ok { background: #1a0f2e; border-color: #6d28d9; color: #c4b5fd; }
+    html.dark .score-check-warning { background: #1a0f2e; border-color: #7c3aed; color: #d8b4fe; }
+    html.dark .score-check-alert { background: #200d3a; border-color: #9370DB; color: #e9d5ff; }
+    html.dark .score-check-loading { background: #130a21; border-color: #4c1d95; color: #a78bfa; }
+
     /* ── Dark Mode Toggle ────────────────────────── */
     .dark-mode-toggle {
       width: 40px;
@@ -4396,8 +4569,7 @@
     html.dark .outcome-card,
     html.dark .trade-summary,
     html.dark .raffle-balance-bar,
-    html.dark .chat-messages,
-    html.dark .score-report-form {
+    html.dark .chat-messages {
       background: #162032;
       border-color: #334155;
     }
@@ -4567,13 +4739,27 @@
       border-color: #7f1d1d;
     }
     html.dark .score-report-msg {
-      background: #1c1a10 !important;
-      border-color: #78350f !important;
+      background: #1a0f2e !important;
+      border-color: #6d28d9 !important;
     }
+    html.dark .score-report-msg .score-report-label { color: #c4b5fd; }
+    html.dark .srb-team-name { color: #e2e8f0; }
+    html.dark .srb-score { color: #c4b5fd; }
+    html.dark .srb-row:first-child { border-bottom-color: #3b1a6e; }
     html.dark .score-report-form {
-      background: #1c1a10;
-      border-color: #78350f;
+      background: #1a0f2e;
+      border-color: #6d28d9;
     }
+    html.dark .score-report-toggle-btn {
+      background: #1a0f2e;
+      border-color: #6d28d9;
+      color: #c4b5fd;
+    }
+    html.dark .score-report-toggle-btn:hover { background: #2d1557; }
+    html.dark .score-team-label { color: #cbd5e1; }
+    html.dark .score-sep { color: #94a3b8; }
+    html.dark .submit-score-btn { background: #7c3aed; }
+    html.dark .submit-score-btn:hover:not(:disabled) { background: #6d28d9; }
     html.dark .admin-winner-box {
       background: #0d231a;
       border-color: #166534;

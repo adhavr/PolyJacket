@@ -90,6 +90,57 @@ def init_database():
         )
     """)
 
+    # Chat messages table (covers both chat and score_report types)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            message_id TEXT PRIMARY KEY,
+            market_id TEXT NOT NULL,
+            username TEXT NOT NULL,
+            user_id INTEGER,
+            message TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            message_type TEXT DEFAULT 'chat',
+            upvotes INTEGER DEFAULT 0,
+            downvotes INTEGER DEFAULT 0,
+            voters_json TEXT DEFAULT '{}',
+            FOREIGN KEY (market_id) REFERENCES markets(market_id)
+        )
+    """)
+
+    # Raffle entries table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS raffle_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            tickets INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Raffle state table (always a single row, id=1)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS raffle_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            raffle_closed INTEGER DEFAULT 0
+        )
+    """)
+    cursor.execute("INSERT OR IGNORE INTO raffle_state (id, raffle_closed) VALUES (1, 0)")
+
+    # Raffle winners table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS raffle_winners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            draw_number INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            email TEXT NOT NULL,
+            tickets INTEGER NOT NULL,
+            total_pool INTEGER NOT NULL,
+            drawn_at TEXT NOT NULL
+        )
+    """)
+
     # Migrate: add raffle_tokens column if it doesn't exist yet
     try:
         cursor.execute("ALTER TABLE users ADD COLUMN raffle_tokens REAL DEFAULT 0")
@@ -102,6 +153,8 @@ def init_database():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_user ON positions(user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_market ON price_history(market_id, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_market ON chat_messages(market_id, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_raffle_entries_user ON raffle_entries(user_id)")
     
     conn.commit()
     conn.close()
@@ -398,6 +451,158 @@ def get_price_history(market_id: str) -> List[Dict]:
         WHERE market_id = ?
         ORDER BY timestamp ASC
     """, (market_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+# ============== CHAT MESSAGES ==============
+
+def save_chat_message(msg: Dict):
+    """Persist a chat message or score report to the database."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO chat_messages
+            (message_id, market_id, username, user_id, message, timestamp, message_type,
+             upvotes, downvotes, voters_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO NOTHING
+    """, (
+        msg["message_id"], msg["market_id"], msg["username"],
+        msg.get("user_id"), msg["message"], msg["timestamp"],
+        msg.get("message_type", "chat"),
+        msg.get("upvotes", 0), msg.get("downvotes", 0),
+        json.dumps(msg.get("voters", {}))
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_chat_messages(market_id: str) -> List[Dict]:
+    """Load all chat messages for a market, ordered by timestamp."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM chat_messages WHERE market_id = ? ORDER BY timestamp ASC
+    """, (market_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        d = dict(row)
+        d["voters"] = json.loads(d.pop("voters_json", "{}") or "{}")
+        result.append(d)
+    return result
+
+
+def get_chat_message_by_id(message_id: str) -> Optional[Dict]:
+    """Load a single chat message by ID."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM chat_messages WHERE message_id = ?", (message_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        d = dict(row)
+        d["voters"] = json.loads(d.pop("voters_json", "{}") or "{}")
+        return d
+    return None
+
+
+def update_chat_vote(message_id: str, upvotes: int, downvotes: int, voters: Dict):
+    """Update vote counts and voter map for a score report."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE chat_messages SET upvotes = ?, downvotes = ?, voters_json = ?
+        WHERE message_id = ?
+    """, (upvotes, downvotes, json.dumps(voters), message_id))
+    conn.commit()
+    conn.close()
+
+
+# ============== RAFFLE ==============
+
+def add_raffle_entry(user_id: int, username: str, tickets: int, timestamp: str):
+    """Record a raffle ticket purchase."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO raffle_entries (user_id, username, tickets, timestamp)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, username, tickets, timestamp))
+    conn.commit()
+    conn.close()
+
+
+def get_all_raffle_entries() -> List[Dict]:
+    """Return all raffle entries."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM raffle_entries ORDER BY timestamp ASC")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_user_raffle_tickets(user_id: int) -> int:
+    """Return total ticket count for a single user."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COALESCE(SUM(tickets),0) as total FROM raffle_entries WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return int(row["total"]) if row else 0
+
+
+def get_total_raffle_tickets() -> int:
+    """Return total tickets across all users."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COALESCE(SUM(tickets),0) as total FROM raffle_entries")
+    row = cursor.fetchone()
+    conn.close()
+    return int(row["total"]) if row else 0
+
+
+def get_raffle_state() -> bool:
+    """Return whether the raffle is closed."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT raffle_closed FROM raffle_state WHERE id = 1")
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row["raffle_closed"]) if row else False
+
+
+def set_raffle_state(closed: bool):
+    """Set the raffle open/closed state."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE raffle_state SET raffle_closed = ? WHERE id = 1", (1 if closed else 0,))
+    conn.commit()
+    conn.close()
+
+
+def save_raffle_winner(winner: Dict):
+    """Persist a raffle winner."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO raffle_winners (draw_number, username, email, tickets, total_pool, drawn_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (winner["draw_number"], winner["username"], winner["email"],
+          winner["tickets"], winner["total_pool"], winner["drawn_at"]))
+    conn.commit()
+    conn.close()
+
+
+def get_raffle_winners() -> List[Dict]:
+    """Return all raffle winners ordered by draw number."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM raffle_winners ORDER BY draw_number ASC")
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]

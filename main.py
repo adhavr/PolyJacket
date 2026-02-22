@@ -58,10 +58,9 @@ markets: Dict[str, dict] = {}
 user_positions: Dict[str, dict] = {}  # user_id -> {market_id: {home_shares, away_shares}}
 games_data = []  # Cached games loaded on startup (List[Game])
 elo_data: Dict[str, Dict[str, float]] = {}  # sport -> team -> elo rating
-chat_messages: Dict[str, List[dict]] = {}  # market_id -> list of messages
-raffle_entries: List[dict] = []  # [{username, user_id, tickets, timestamp}]
-raffle_closed: bool = False  # Set to True by admin to stop ticket purchases
-raffle_winners: List[dict] = []  # All winners drawn so far
+# chat_messages and raffle_entries are now persisted in SQLite (see database.py)
+raffle_closed: bool = False  # Loaded from DB on startup
+raffle_winners: List[dict] = []  # Loaded from DB on startup
 
 # Admin
 ADMIN_USERNAME = "superuser"
@@ -220,6 +219,7 @@ class ChatMessage(BaseModel):
     message_id: str
     market_id: str
     username: str
+    user_id: Optional[int] = None
     message: str
     timestamp: str
     message_type: str = "chat"  # "chat" or "score_report"
@@ -412,6 +412,113 @@ def calculate_sell_value(user_shares: float, current_side_shares: float, other_s
         return int(max(0.0, before - after))
     except:
         return 0.0
+
+
+def score_credibility_check(home_score: int, away_score: int, home_elo: Optional[float], away_elo: Optional[float]) -> dict:
+    """
+    Assess whether a reported score is credible given the teams' ELO ratings.
+    
+    Logic (margin-only, no time assumption):
+    1. Compute ELO-implied win probability for the home team.
+    2. Map that probability to an expected *final* point margin using a
+       sport-agnostic linear relationship calibrated to typical intramural
+       game scoring (total ~30-60 pts per side across all sports).
+    3. Compare the reported margin to the expected margin.  Flag the result
+       if it deviates beyond sport-realistic thresholds.
+    
+    Returns a dict with:
+      - is_suspicious: bool
+      - severity: 'ok' | 'warning' | 'alert'
+      - flags: list of human-readable flag strings
+      - expected_winner: 'home' | 'away' | 'toss-up'
+      - elo_win_prob: float (home win probability)
+      - expected_margin: float (positive = home favored)
+      - reported_margin: int (positive = home won)
+    """
+    flags = []
+
+    # ── ELO win probability ───────────────────────────────────────────────
+    if home_elo and away_elo:
+        elo_diff = home_elo - away_elo
+        # Standard ELO 400-point scale
+        home_win_prob = 1.0 / (1.0 + 10 ** (-elo_diff / 400.0))
+    else:
+        home_win_prob = 0.5  # no ELO data → treat as toss-up
+
+    # Map win probability → expected final score margin
+    # At 50% → 0 pt margin; at ~90% → +15 pt margin (typical IM blowout)
+    # Linear: margin = (prob - 0.5) * 30
+    expected_margin = (home_win_prob - 0.5) * 30.0
+    reported_margin = home_score - away_score
+
+    if home_win_prob >= 0.6:
+        expected_winner = 'home'
+    elif home_win_prob <= 0.4:
+        expected_winner = 'away'
+    else:
+        expected_winner = 'toss-up'
+
+    # ── Flag: massive upset ───────────────────────────────────────────────
+    # The ELO-favored team lost by a large margin
+    if expected_winner == 'home' and reported_margin < -10 and home_win_prob > 0.7:
+        flags.append(
+            f"Upset alert: ELO favored home ({home_win_prob:.0%} win prob) "
+            f"but home lost by {abs(reported_margin)}"
+        )
+    elif expected_winner == 'away' and reported_margin > 10 and home_win_prob < 0.3:
+        flags.append(
+            f"Upset alert: ELO favored away ({1-home_win_prob:.0%} win prob) "
+            f"but home won by {reported_margin}"
+        )
+
+    # ── Flag: margin deviation far from ELO expectation ──────────────────
+    margin_deviation = abs(reported_margin - expected_margin)
+    if margin_deviation > 25:
+        flags.append(
+            f"Large margin deviation: ELO predicts ~{expected_margin:+.0f} pts "
+            f"but reported margin is {reported_margin:+d} pts "
+            f"(deviation {margin_deviation:.0f} pts)"
+        )
+
+    # ── Flag: implausibly large scores ───────────────────────────────────
+    # Intramural games rarely exceed ~80 pts per team in any sport
+    if home_score > 80 or away_score > 80:
+        flags.append(
+            f"Unusually high score: {home_score}–{away_score} "
+            f"(over 80 pts for one team is rare in intramural play)"
+        )
+
+    # ── Flag: implausibly large single-game margin ────────────────────────
+    if abs(reported_margin) > 50:
+        flags.append(
+            f"Extreme margin: {abs(reported_margin)}-point difference is "
+            f"very rare in intramural competition"
+        )
+
+    # ── Flag: both scores identical and non-zero tie ──────────────────────
+    if home_score == away_score and home_score > 0:
+        flags.append(
+            f"Tie score ({home_score}–{away_score}): verify this is intentional "
+            f"(will be settled as a push/void)"
+        )
+
+    # ── Determine severity ────────────────────────────────────────────────
+    if len(flags) == 0:
+        severity = 'ok'
+    elif len(flags) == 1 and margin_deviation <= 35:
+        severity = 'warning'
+    else:
+        severity = 'alert'
+
+    return {
+        'is_suspicious': len(flags) > 0,
+        'severity': severity,
+        'flags': flags,
+        'expected_winner': expected_winner,
+        'elo_win_prob': round(home_win_prob, 3),
+        'expected_margin': round(expected_margin, 1),
+        'reported_margin': reported_margin,
+    }
 
 
 def is_market_closed(game_time: str, game_date: str) -> bool:
@@ -1096,8 +1203,8 @@ async def get_chat_messages(market_id: str):
     market = db.get_market(market_id)
     if not market:
         raise HTTPException(status_code=404, detail="Market not found")
-    
-    messages = chat_messages.get(market_id, [])
+
+    messages = db.get_chat_messages(market_id)
     return ChatResponse(success=True, messages=messages)
 
 
@@ -1128,15 +1235,14 @@ async def post_chat_message(
         message_id=str(uuid.uuid4()),
         market_id=market_id,
         username=user["username"],
+        user_id=user["id"],
         message=chat_request.message.strip(),
         timestamp=datetime.utcnow().isoformat()
     )
     
     # Store message
-    if market_id not in chat_messages:
-        chat_messages[market_id] = []
-    chat_messages[market_id].append(message.dict())
-    
+    db.save_chat_message(message.dict())
+
     return {"success": True, "message": message}
 
 
@@ -1165,14 +1271,15 @@ async def post_score_report(
         message_id=str(uuid.uuid4()),
         market_id=market_id,
         username=user["username"],
+        user_id=user["id"],
         message=formatted,
         timestamp=datetime.utcnow().isoformat(),
         message_type="score_report"
     )
 
-    if market_id not in chat_messages:
-        chat_messages[market_id] = []
-    chat_messages[market_id].append(message.dict())
+    msg_dict = message.dict()
+    msg_dict["voters"] = {}
+    db.save_chat_message(msg_dict)
 
     return {"success": True, "message": message}
 
@@ -1191,15 +1298,14 @@ async def vote_score_report(
     if vote_req.vote not in ("up", "down"):
         raise HTTPException(status_code=400, detail="Vote must be 'up' or 'down'")
 
-    messages = chat_messages.get(market_id, [])
-    msg = next((m for m in messages if m["message_id"] == message_id), None)
+    msg = db.get_chat_message_by_id(message_id)
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
     if msg.get("message_type") != "score_report":
         raise HTTPException(status_code=400, detail="Can only vote on score reports")
 
     username = user["username"]
-    voters = msg.setdefault("voters", {})
+    voters = msg.get("voters", {})
     current_vote = voters.get(username)
 
     # Toggle: clicking the same direction removes the vote
@@ -1210,6 +1316,9 @@ async def vote_score_report(
 
     msg["upvotes"] = sum(1 for v in voters.values() if v == "up")
     msg["downvotes"] = sum(1 for v in voters.values() if v == "down")
+    msg["voters"] = voters
+
+    db.update_chat_vote(message_id, msg["upvotes"], msg["downvotes"], voters)
 
     return {"success": True, "message": msg}
 
@@ -1221,7 +1330,7 @@ async def get_raffle(user: Optional[Dict] = Depends(get_current_user)):
     user_tickets = 0
     user_rt = 0
     if user:
-        user_tickets = sum(e["tickets"] for e in raffle_entries if e["user_id"] == user["id"])
+        user_tickets = db.get_user_raffle_tickets(user["id"])
         user_rt = round(user.get("raffle_tokens") or 0, 2)
     return {
         "success": True,
@@ -1235,7 +1344,7 @@ async def get_raffle(user: Optional[Dict] = Depends(get_current_user)):
         "user_tickets": user_tickets,
         "user_raffle_tokens": user_rt,
         "raffle_closed": raffle_closed,
-        "raffle_winners": raffle_winners if is_admin(user) else None
+        "raffle_winners": db.get_raffle_winners() if is_admin(user) else None
     }
 
 
@@ -1264,15 +1373,11 @@ async def buy_raffle_tickets(
     db.deduct_raffle_tokens(user["id"], tier["cost"])
     refreshed = db.get_user_by_id(user["id"])
 
-    raffle_entries.append({
-        "user_id": user["id"],
-        "username": user["username"],
-        "tickets": tier["tickets"],
-        "timestamp": datetime.utcnow().isoformat()
-    })
+    entry_ts = datetime.utcnow().isoformat()
+    db.add_raffle_entry(user["id"], user["username"], tier["tickets"], entry_ts)
 
-    total_tickets = sum(e["tickets"] for e in raffle_entries)
-    user_tickets = sum(e["tickets"] for e in raffle_entries if e["user_id"] == user["id"])
+    total_tickets = db.get_total_raffle_tickets()
+    user_tickets = db.get_user_raffle_tickets(user["id"])
 
     return {
         "success": True,
@@ -1864,22 +1969,24 @@ async def admin_run_raffle(user: Optional[Dict] = Depends(get_current_user)):
     if raffle_closed:
         raise HTTPException(status_code=400, detail="Raffle is closed \u2014 reopen it before drawing more winners")
 
-    if not raffle_entries:
+    all_entries = db.get_all_raffle_entries()
+    if not all_entries:
         raise HTTPException(status_code=400, detail="No raffle entries \u2014 no tickets have been purchased yet")
 
     import random
     # Build weighted pool: one slot per ticket
     pool = []
-    for entry in raffle_entries:
+    for entry in all_entries:
         pool.extend([{"user_id": entry["user_id"], "username": entry["username"]}] * entry["tickets"])
 
     picked = random.choice(pool)
     winner_user = db.get_user_by_id(picked["user_id"])
     winner_email = winner_user["email"] if winner_user else "unknown"
     winner_username = picked["username"]
-    winner_tickets = sum(e["tickets"] for e in raffle_entries if e["user_id"] == picked["user_id"])
+    winner_tickets = sum(e["tickets"] for e in all_entries if e["user_id"] == picked["user_id"])
     total_pool = len(pool)
-    draw_num = len(raffle_winners) + 1
+    all_winners = db.get_raffle_winners()
+    draw_num = len(all_winners) + 1
 
     new_winner = {
         "draw_number": draw_num,
@@ -1889,7 +1996,8 @@ async def admin_run_raffle(user: Optional[Dict] = Depends(get_current_user)):
         "total_pool": total_pool,
         "drawn_at": datetime.utcnow().isoformat()
     }
-    raffle_winners.append(new_winner)
+    db.save_raffle_winner(new_winner)
+    raffle_winners = db.get_raffle_winners()
 
     print(f"[raffle] Draw #{draw_num}: {winner_username} ({winner_email}) \u2014 {winner_tickets}/{total_pool} tickets")
 
@@ -1908,6 +2016,7 @@ async def admin_close_raffle(user: Optional[Dict] = Depends(get_current_user)):
     require_admin(user)
     global raffle_closed
     raffle_closed = True
+    db.set_raffle_state(True)
     print("[raffle] Raffle closed by admin")
     return {"success": True, "raffle_closed": True, "message": "Raffle is now closed. No more tickets can be purchased."}
 
@@ -1918,8 +2027,54 @@ async def admin_open_raffle(user: Optional[Dict] = Depends(get_current_user)):
     require_admin(user)
     global raffle_closed
     raffle_closed = False
+    db.set_raffle_state(False)
     print("[raffle] Raffle reopened by admin")
     return {"success": True, "raffle_closed": False, "message": "Raffle is now open. Ticket purchases are allowed."}
+
+
+@app.get("/api/markets/{market_id}/check-score")
+async def user_check_score(
+    market_id: str,
+    home_score: int,
+    away_score: int,
+    user: Optional[Dict] = Depends(get_current_user)
+):
+    """Assess whether a reported score is credible (available to all logged-in users)."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    market = db.get_market(market_id)
+    if not market:
+        raise HTTPException(status_code=404, detail="Market not found")
+    result = score_credibility_check(
+        home_score, away_score,
+        market.get("home_elo"), market.get("away_elo")
+    )
+    result["home_team"] = market["home_team"]
+    result["away_team"] = market["away_team"]
+    return result
+
+
+@app.get("/api/admin/check-score")
+async def admin_check_score(
+    market_id: str,
+    home_score: int,
+    away_score: int,
+    user: Optional[Dict] = Depends(get_current_user)
+):
+    """Admin: assess whether a reported final score is credible given ELO ratings."""
+    require_admin(user)
+    market = db.get_market(market_id)
+    if not market:
+        raise HTTPException(status_code=404, detail="Market not found")
+    result = score_credibility_check(
+        home_score, away_score,
+        market.get("home_elo"), market.get("away_elo")
+    )
+    result["home_team"] = market["home_team"]
+    result["away_team"] = market["away_team"]
+    result["home_elo"] = market.get("home_elo")
+    result["away_elo"] = market.get("away_elo")
+    return result
 
 
 @app.post("/api/admin/settle-game")
@@ -2000,24 +2155,31 @@ async def admin_settle_game(
 async def admin_raffle_status(user: Optional[Dict] = Depends(get_current_user)):
     """Admin: get full raffle status including total tickets and all winners drawn."""
     require_admin(user)
-    total_tickets = sum(e["tickets"] for e in raffle_entries)
+    all_entries = db.get_all_raffle_entries()
+    all_winners = db.get_raffle_winners()
+    total_tickets = sum(e["tickets"] for e in all_entries)
     return {
         "success": True,
         "raffle_closed": raffle_closed,
         "total_tickets": total_tickets,
-        "total_entrants": len(raffle_entries),
-        "winners": raffle_winners,
-        "draws_so_far": len(raffle_winners)
+        "total_entrants": len(all_entries),
+        "winners": all_winners,
+        "draws_so_far": len(all_winners)
     }
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize database, load Elo ratings, seed from cache, then start background refresh loop"""
-    global games_data
+    global games_data, raffle_closed, raffle_winners
 
     # Initialize database
     db.init_database()
+
+    # Load persisted raffle state
+    raffle_closed = db.get_raffle_state()
+    raffle_winners = db.get_raffle_winners()
+    print(f"[startup] Raffle state loaded: closed={raffle_closed}, winners={len(raffle_winners)}")
 
     # Load Elo ratings first so market seeding has data
     load_elo_data()
